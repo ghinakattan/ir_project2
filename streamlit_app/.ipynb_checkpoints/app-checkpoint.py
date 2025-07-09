@@ -208,11 +208,11 @@ def query_search(query: str, dataset: str, top_k: int, mode: str):
     يستدعي API البحث حسب وضع البحث (tfidf, embedding, hybrid)
     """
     endpoint_map = {
-        "tfidf": "/query-match",
+        "tfidf": "/query_match",
         "embedding": "/query-embedding",
         "hybrid": "/query-hybrid"
     }
-    url = API_BASE_URL + endpoint_map.get(mode, "/query-match")
+    url = API_BASE_URL + endpoint_map.get(mode, "/query_match")
     payload = {"query": query, "dataset": dataset, "top_k": top_k}
     try:
         response = requests.post(url, json=payload)
@@ -224,7 +224,7 @@ def query_search(query: str, dataset: str, top_k: int, mode: str):
 
 def main():
     st.title("محرك بحث النصوص")
-    st.write("اكتب استعلام البحث واختر إعدادات البحث ثم نفذ البحث.")
+    st.write("")
 
     # مدخلات المستخدم
     query_text = st.text_area("ادخل استعلام البحث", height=80)
