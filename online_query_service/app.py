@@ -12,6 +12,8 @@ from nltk.stem import WordNetLemmatizer, PorterStemmer
 import numpy as np
 import time
 from sentence_transformers import SentenceTransformer
+from collections import defaultdict
+
 app = FastAPI()
 
 # ================================
@@ -84,6 +86,8 @@ def query_match(request: MatchRequest):
 
 @app.post("/query-embedding")
 def query_embedding(request: MatchRequest):
+    start_time = time.time()
+
     dataset = request.dataset
     top_k = request.top_k
 
@@ -124,12 +128,16 @@ def query_embedding(request: MatchRequest):
     top_indices = scores.argsort()[::-1][:top_k]
     results = [{"doc_id": doc_ids[i], "score": float(scores[i])} for i in top_indices]
 
+    duration = round(time.time() - start_time, 4)
+
     return {
         "query": request.query,
         "cleaned_query": cleaned_query,
         "top_k": top_k,
-        "results": results
+        "results": results,
+        "duration_seconds": duration   
     }
+    
 @app.post("/query-hybrid")
 def query_hybrid(request: MatchRequest):
     start_time = time.time()
@@ -282,3 +290,86 @@ def query_match_clustered(request: MatchRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+
+@app.post("/query-match-embedding-clustered")
+def query_matching_service(request: MatchRequest):
+    start_time = time.perf_counter()
+
+    dataset = request.dataset
+    top_k = request.top_k
+
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+
+    # مسارات الملفات
+    embedding_matrix_path = os.path.join(base_dir, 'offline_indexing_service', 'data', dataset, 'doc_embeddings.npy')
+    doc_ids_path = os.path.join(base_dir, 'offline_indexing_service', 'data', dataset, 'embedding_doc_ids.json')
+    clusters_csv_path = os.path.join(base_dir, 'offline_indexing_service', 'data', dataset, 'embedding_clusters.csv')
+
+    for path in [embedding_matrix_path, doc_ids_path, clusters_csv_path]:
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404, detail=f"❌ ملف {os.path.basename(path)} غير موجود")
+
+    # تحميل البيانات
+    embeddings = np.load(embedding_matrix_path)
+    with open(doc_ids_path, "r") as f:
+        doc_ids = json.load(f)
+    # تحويل doc_ids إلى نصوص لمطابقة المفاتيح في CSV
+    doc_ids = [str(doc_id) for doc_id in doc_ids]
+
+    df_clusters = pd.read_csv(clusters_csv_path)
+    df_clusters['doc_id'] = df_clusters['doc_id'].astype(str)
+
+    # خريطة من doc_id إلى cluster_label
+    doc_cluster_map = dict(zip(df_clusters['doc_id'], df_clusters['cluster_label']))
+
+    # خريطة من doc_id إلى فهرس embedding
+    docid_to_index = {doc_id: idx for idx, doc_id in enumerate(doc_ids)}
+
+    # تحميل نموذج التضمين (embedding model)
+    model_path = os.path.join(base_dir, 'offline_indexing_service', 'data', dataset, 'embedding_model', 'model.joblib')
+    if not os.path.exists(model_path):
+        raise HTTPException(status_code=404, detail=f"❌ model.joblib غير موجود: {model_path}")
+    model = joblib.load(model_path)
+
+    # تنظيف وتمثيل الاستعلام
+    cleaned_query = clean_text(request.query)
+    query_vec = model.encode([cleaned_query])  # مصفوفة (1, dim)
+
+    # حساب التشابه (cosine similarity) بين الاستعلام والوثائق
+    scores = cosine_similarity(query_vec, embeddings)[0]
+
+    # تجميع الدرجات حسب كلستر الوثائق
+    clusters_scores = {}
+    for doc_id, score in zip(doc_ids, scores):
+        cluster_label = doc_cluster_map.get(doc_id, -1)  # -1 للوثائق غير المصنفة
+        clusters_scores.setdefault(cluster_label, 0)
+        clusters_scores[cluster_label] += score
+
+    # ترتيب الكلسترات حسب مجموع الدرجات (score sum) تنازليًا
+    sorted_clusters = sorted(clusters_scores.items(), key=lambda x: x[1], reverse=True)
+
+    # ترتيب الوثائق داخل كل كلستر حسب الدرجة (score)
+    results = []
+    for cluster_label, _ in sorted_clusters:
+        cluster_docs = [doc_id for doc_id, cl_label in doc_cluster_map.items() if cl_label == cluster_label]
+        cluster_docs_scores = []
+        for doc_id in cluster_docs:
+            idx = docid_to_index.get(doc_id)
+            if idx is not None:
+                cluster_docs_scores.append((doc_id, scores[idx]))
+        cluster_docs_scores.sort(key=lambda x: x[1], reverse=True)
+        results.extend(cluster_docs_scores)
+
+    # أخذ أول top_k نتائج
+    results = results[:top_k]
+    results = [{"doc_id": doc_id, "score": float(score)} for doc_id, score in results]
+
+    duration = round(time.perf_counter() - start_time, 4)
+    return {
+        "query": request.query,
+        "dataset": dataset,
+        "top_k": top_k,
+        "duration_seconds": duration,
+        "results": results
+    }
