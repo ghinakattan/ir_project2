@@ -8,12 +8,14 @@ API_BASE_URL = "http://localhost:8000"  # عدل حسب عنوان سيرفر Fa
 
 def query_search(query: str, dataset: str, top_k: int, mode: str):
     """
-    يستدعي API البحث حسب وضع البحث (tfidf, embedding, hybrid)
+    يستدعي API البحث حسب وضع البحث (tfidf, embedding, hybrid, tfidf-clustered, embedding-clustered)
     """
     endpoint_map = {
         "tfidf": "/query_match",
         "embedding": "/query-embedding",
-        "hybrid": "/query-hybrid"
+        "hybrid": "/query-hybrid",
+        "tfidf-clustered": "/query-match-clustered",
+        "embedding-clustered": "/query-match-embedding-clustered"
     }
     url = API_BASE_URL + endpoint_map.get(mode, "/query_match")
     payload = {"query": query, "dataset": dataset, "top_k": top_k}
@@ -26,28 +28,36 @@ def query_search(query: str, dataset: str, top_k: int, mode: str):
         return None
 
 def main():
-    st.title("محرك بحث النصوص")
-    st.write("")
+    st.title("🔎 Information Retrieval System")
+    st.markdown("---")
 
     # مدخلات المستخدم
-    query_text = st.text_area("ادخل استعلام البحث", height=80)
+    query_text = st.text_area("📝 ادخل استعلام البحث", height=80)
 
     col1, col2 = st.columns(2)
     with col1:
         dataset = st.selectbox(
-            "اختر مجموعة البيانات",
+            "📚 اختر مجموعة البيانات",
             options=["trec_tot", "antique"],
             index=0
         )
     with col2:
-        top_k = st.number_input("عدد النتائج المراد عرضها", min_value=1, max_value=50, value=10, step=1)
+        top_k = st.number_input("📊 عدد النتائج المراد عرضها", min_value=1, max_value=50, value=10, step=1)
 
-    mode = st.radio(
-        "نوع التمثيل:",
-        options=["tfidf", "embedding", "hybrid"],
-        index=0,
-        horizontal=True
+    # اختيار نوع التمثيل مع تسمية واضحة
+    representation_options = {
+        "TF-IDF (تقليدي)": "tfidf",
+        "Embedding (تقليدي)": "embedding",
+        "Hybrid (دمج)": "hybrid",
+        "TF-IDF داخل كل عنقود": "tfidf-clustered",
+        "Embedding داخل كل عنقود": "embedding-clustered"
+    }
+
+    mode_label = st.selectbox(
+        "🧠 اختر نوع التمثيل:",
+        options=list(representation_options.keys())
     )
+    mode = representation_options[mode_label]
 
     colb1, colb2 = st.columns(2)
     with colb1:
@@ -58,6 +68,7 @@ def main():
     # مساحة عرض النتائج
     results_placeholder = st.empty()
     cleaned_query_placeholder = st.empty()
+    duration_seconds_placeholder = st.empty()
 
     if search_btn:
         if not query_text.strip():
@@ -69,13 +80,16 @@ def main():
                     # عرض النص بعد التنظيف
                     cleaned_query = data.get("cleaned_query", "")
                     if cleaned_query:
-                        cleaned_query_placeholder.markdown(f"**النص بعد التنظيف:** {cleaned_query}")
+                        cleaned_query_placeholder.markdown(f"**🧹 النص بعد التنظيف:** `{cleaned_query}`")
+
+                    duration_seconds = data.get("duration_seconds", "")
+                    if duration_seconds:
+                        duration_seconds_placeholder.markdown(f"⏱ **الوقت المستغرق:** `{duration_seconds}` ثانية")
 
                     # عرض النتائج
                     results = data.get("results", [])
                     if results:
                         df = pd.DataFrame(results)
-                        # عرض الجدول بشكل قابل للتمرير
                         results_placeholder.dataframe(df)
                     else:
                         results_placeholder.info("لا توجد نتائج للعرض.")
@@ -88,7 +102,7 @@ def main():
         else:
             with st.spinner("جاري تحسين الاستعلام..."):
                 try:
-                    refine_api_url = "http://localhost:8001/refine-query"  # رابط خدمة تحسين الاستعلام
+                    refine_api_url = "http://localhost:8001/refine-query"
 
                     payload = {
                         "query": query_text,
@@ -98,7 +112,7 @@ def main():
                             "query_suggestion": True
                         }
                     }
-                    params = {"dataset": dataset}  # dataset كـ query param
+                    params = {"dataset": dataset}
 
                     response = requests.post(refine_api_url, params=params, json=payload)
                     response.raise_for_status()
@@ -153,3 +167,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

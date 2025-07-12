@@ -13,7 +13,7 @@ import numpy as np
 import time
 from sentence_transformers import SentenceTransformer
 from collections import defaultdict
-
+import sqlite3
 app = FastAPI()
 
 # ================================
@@ -42,9 +42,17 @@ class MatchRequest(BaseModel):
     dataset: str = "trec_tot"
     top_k: int = 10
 
-# ================================
-# خدمة TF-IDF
-# ================================
+
+DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data', 'ir_docs.db'))
+
+def get_table_name(dataset):
+    if dataset == "trec_tot":
+        return "trec_tot_documents"
+    elif dataset == "antique":
+        return "antique_documents"
+    else:
+        return None
+
 @app.post("/query_match")
 def query_match(request: MatchRequest):
     start_time = time.time()
@@ -69,7 +77,32 @@ def query_match(request: MatchRequest):
     scores = cosine_similarity(query_vec, tfidf_matrix)[0]
 
     top_indices = scores.argsort()[::-1][:request.top_k]
-    results = [{"doc_id": doc_ids[i], "score": float(scores[i])} for i in top_indices]
+
+    table_name = get_table_name(dataset)
+    if table_name is None:
+        raise HTTPException(status_code=400, detail="اسم مجموعة البيانات غير صحيح")
+
+    # افتح اتصال بقاعدة البيانات
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    results = []
+    for i in top_indices:
+        doc_id = doc_ids[i]
+        score = float(scores[i])
+
+        # استعلام جلب النص الأصلي بناءً على doc_id
+        cursor.execute(f"SELECT doc_text FROM {table_name} WHERE doc_id = ?", (doc_id,))
+        row = cursor.fetchone()
+        text = row[0] if row else "النص غير متوفر"
+
+        results.append({
+            "doc_id": doc_id,
+            "score": score,
+            "text": text
+        })
+
+    conn.close()
 
     duration = round(time.time() - start_time, 4)
 
@@ -83,15 +116,12 @@ def query_match(request: MatchRequest):
     }
 
 
-
 @app.post("/query-embedding")
 def query_embedding(request: MatchRequest):
     start_time = time.time()
 
     dataset = request.dataset
     top_k = request.top_k
-
-    print(f"Dataset requested: {dataset}")
 
     # تنظيف الاستعلام
     cleaned_query = clean_text(request.query)
@@ -100,10 +130,6 @@ def query_embedding(request: MatchRequest):
     model_path = os.path.join(base_dir, 'offline_indexing_service', 'data', dataset, 'embedding_model', 'model.joblib')
     doc_embeddings_path = os.path.join(base_dir, 'offline_indexing_service', 'data', dataset, 'doc_embeddings.npy')
     doc_ids_path = os.path.join(base_dir, 'offline_indexing_service', 'data', dataset, 'embedding_doc_ids.json')
-
-    print(f"Model path: {model_path}")
-    print(f"Doc embeddings path: {doc_embeddings_path}")
-    print(f"Doc IDs path: {doc_ids_path}")
 
     if not os.path.exists(model_path):
         raise HTTPException(status_code=404, detail=f"❌ model.joblib غير موجود: {model_path}")
@@ -118,15 +144,39 @@ def query_embedding(request: MatchRequest):
     with open(doc_ids_path, "r") as f:
         doc_ids = json.load(f)
 
-    # تحقق من أن doc_ids قائمة
     if not isinstance(doc_ids, list):
-        raise HTTPException(status_code=500, detail=f"❌ محتوى embedding_doc_ids.json غير صحيح (ليس قائمة) في: {doc_ids_path}")
+        raise HTTPException(status_code=500, detail=f"❌ محتوى embedding_doc_ids.json غير صحيح")
 
     query_vec = model.encode([cleaned_query])
     scores = cosine_similarity(query_vec, doc_embeddings)[0]
 
     top_indices = scores.argsort()[::-1][:top_k]
-    results = [{"doc_id": doc_ids[i], "score": float(scores[i])} for i in top_indices]
+
+    # ربط بقاعدة البيانات
+    table_name = get_table_name(dataset)
+    if table_name is None:
+        raise HTTPException(status_code=400, detail="❌ اسم مجموعة البيانات غير صالح")
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    results = []
+    for i in top_indices:
+        doc_id = doc_ids[i]
+        score = float(scores[i])
+
+        # جلب النص الأصلي من الجدول
+        cursor.execute(f"SELECT doc_text FROM {table_name} WHERE doc_id = ?", (doc_id,))
+        row = cursor.fetchone()
+        text = row[0] if row else "النص غير متوفر"
+
+        results.append({
+            "doc_id": doc_id,
+            "score": score,
+            "text": text
+        })
+
+    conn.close()
 
     duration = round(time.time() - start_time, 4)
 
@@ -137,7 +187,7 @@ def query_embedding(request: MatchRequest):
         "results": results,
         "duration_seconds": duration   
     }
-    
+
 @app.post("/query-hybrid")
 def query_hybrid(request: MatchRequest):
     start_time = time.time()
@@ -158,28 +208,25 @@ def query_hybrid(request: MatchRequest):
     doc_embeddings_path = os.path.join(base_dir, 'offline_indexing_service', 'data', dataset, 'doc_embeddings.npy')
     embedding_doc_ids_path = os.path.join(base_dir, 'offline_indexing_service', 'data', dataset, 'embedding_doc_ids.json')
 
-    # تحقق من وجود ملفات TF-IDF
     if not os.path.exists(tfidf_vectorizer_path) or not os.path.exists(tfidf_matrix_path) or not os.path.exists(tfidf_doc_ids_path):
-        raise HTTPException(status_code=404, detail="ملفات TF-IDF غير موجودة للمجموعة المحددة")
-
-    # تحقق من وجود ملفات Embedding
+        raise HTTPException(status_code=404, detail="❌ ملفات TF-IDF غير موجودة")
     if not os.path.exists(model_path) or not os.path.exists(doc_embeddings_path) or not os.path.exists(embedding_doc_ids_path):
-        raise HTTPException(status_code=404, detail="ملفات Embedding غير موجودة للمجموعة المحددة")
+        raise HTTPException(status_code=404, detail="❌ ملفات Embedding غير موجودة")
 
-    # تحميل موارد TF-IDF
+    # تحميل بيانات TF-IDF
     vectorizer = joblib.load(tfidf_vectorizer_path)
     tfidf_matrix = sparse.load_npz(tfidf_matrix_path)
     with open(tfidf_doc_ids_path, "r") as f:
         doc_ids_tfidf = json.load(f)
 
-    # تحميل موارد Embedding
+    # تحميل بيانات Embedding
     model = joblib.load(model_path)
     doc_embeddings = np.load(doc_embeddings_path)
     with open(embedding_doc_ids_path, "r") as f:
         doc_ids_emb = json.load(f)
 
     if not isinstance(doc_ids_tfidf, list) or not isinstance(doc_ids_emb, list):
-        raise HTTPException(status_code=500, detail="محتوى ملفات معرّفات الوثائق غير صحيح")
+        raise HTTPException(status_code=500, detail="❌ صيغة ملفات doc_ids غير صحيحة")
 
     # حساب نتائج TF-IDF
     query_vec_tfidf = vectorizer.transform([cleaned_query])
@@ -191,7 +238,7 @@ def query_hybrid(request: MatchRequest):
     scores_emb = cosine_similarity(query_vec_emb, doc_embeddings)[0]
     emb_scores_dict = dict(zip(doc_ids_emb, scores_emb))
 
-    # دمج النتائج (متوسط درجات TF-IDF و Embedding)
+    # دمج النتائج
     all_doc_ids = set(doc_ids_tfidf).union(set(doc_ids_emb))
     hybrid_scores = []
     for doc_id in all_doc_ids:
@@ -200,10 +247,31 @@ def query_hybrid(request: MatchRequest):
         avg_score = (score_tfidf + score_emb) / 2
         hybrid_scores.append((doc_id, avg_score))
 
-    # ترتيب النتائج واختيار الأعلى
+    # اختيار أعلى النتائج
     hybrid_scores.sort(key=lambda x: x[1], reverse=True)
     top_results = hybrid_scores[:top_k]
-    results = [{"doc_id": doc_id, "score": float(score)} for doc_id, score in top_results]
+
+    # استرجاع النصوص الأصلية من قاعدة البيانات
+    table_name = get_table_name(dataset)
+    if table_name is None:
+        raise HTTPException(status_code=400, detail="❌ اسم مجموعة البيانات غير معروف")
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    results = []
+    for doc_id, score in top_results:
+        cursor.execute(f"SELECT doc_text FROM {table_name} WHERE doc_id = ?", (doc_id,))
+        row = cursor.fetchone()
+        text = row[0] if row else "النص غير متوفر"
+
+        results.append({
+            "doc_id": doc_id,
+            "score": float(score),
+            "text": text
+        })
+
+    conn.close()
 
     duration = round(time.time() - start_time, 4)
 
@@ -215,7 +283,6 @@ def query_hybrid(request: MatchRequest):
         "results": results,
         "duration_seconds": duration
     }
-    
 
 @app.post("/query-match-clustered")
 def query_match_clustered(request: MatchRequest):
@@ -234,7 +301,7 @@ def query_match_clustered(request: MatchRequest):
         # التحقق من وجود الملفات
         for path in [vectorizer_path, matrix_path, doc_ids_path, clusters_csv_path]:
             if not os.path.exists(path):
-                raise HTTPException(status_code=404, detail=f"ملف {os.path.basename(path)} غير موجود")
+                raise HTTPException(status_code=404, detail=f"❌ ملف {os.path.basename(path)} غير موجود")
 
         # تحميل الملفات
         vectorizer = joblib.load(vectorizer_path)
@@ -258,7 +325,15 @@ def query_match_clustered(request: MatchRequest):
             clusters_scores.setdefault(cluster_label, 0)
             clusters_scores[cluster_label] += score
 
+        # ترتيب الكلسترات حسب الأهمية
         sorted_clusters = sorted(clusters_scores.items(), key=lambda x: x[1], reverse=True)
+
+        # تجهيز قاعدة البيانات
+        table_name = get_table_name(dataset)
+        if table_name is None:
+            raise HTTPException(status_code=400, detail="❌ اسم مجموعة البيانات غير معروف")
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
 
         # ترتيب الوثائق داخل كل كلستر
         results = []
@@ -272,7 +347,22 @@ def query_match_clustered(request: MatchRequest):
             cluster_docs_scores.sort(key=lambda x: x[1], reverse=True)
             results.extend(cluster_docs_scores)
 
+        # اختيار أعلى top_k
         results = results[:request.top_k]
+
+        # إحضار النصوص من قاعدة البيانات
+        final_results = []
+        for doc_id, score in results:
+            cursor.execute(f"SELECT doc_text FROM {table_name} WHERE doc_id = ?", (doc_id,))
+            row = cursor.fetchone()
+            text = row[0] if row else "النص غير متوفر"
+            final_results.append({
+                "doc_id": doc_id,
+                "score": float(score),
+                "text": text
+            })
+
+        conn.close()
 
         execution_time = round(time.perf_counter() - start_time, 4)
 
@@ -282,18 +372,15 @@ def query_match_clustered(request: MatchRequest):
             "dataset": dataset,
             "top_k": request.top_k,
             "duration_seconds": execution_time,
-            "results": [
-                {"doc_id": doc_id, "score": float(score)} for doc_id, score in results
-            ]
+            "results": final_results
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-
 @app.post("/query-match-embedding-clustered")
-def query_matching_service(request: MatchRequest):
+def query_match_clustered(request: MatchRequest):
     start_time = time.perf_counter()
 
     dataset = request.dataset
@@ -314,43 +401,33 @@ def query_matching_service(request: MatchRequest):
     embeddings = np.load(embedding_matrix_path)
     with open(doc_ids_path, "r") as f:
         doc_ids = json.load(f)
-    # تحويل doc_ids إلى نصوص لمطابقة المفاتيح في CSV
     doc_ids = [str(doc_id) for doc_id in doc_ids]
 
     df_clusters = pd.read_csv(clusters_csv_path)
     df_clusters['doc_id'] = df_clusters['doc_id'].astype(str)
 
-    # خريطة من doc_id إلى cluster_label
     doc_cluster_map = dict(zip(df_clusters['doc_id'], df_clusters['cluster_label']))
-
-    # خريطة من doc_id إلى فهرس embedding
     docid_to_index = {doc_id: idx for idx, doc_id in enumerate(doc_ids)}
 
-    # تحميل نموذج التضمين (embedding model)
     model_path = os.path.join(base_dir, 'offline_indexing_service', 'data', dataset, 'embedding_model', 'model.joblib')
     if not os.path.exists(model_path):
         raise HTTPException(status_code=404, detail=f"❌ model.joblib غير موجود: {model_path}")
     model = joblib.load(model_path)
 
-    # تنظيف وتمثيل الاستعلام
     cleaned_query = clean_text(request.query)
-    query_vec = model.encode([cleaned_query])  # مصفوفة (1, dim)
-
-    # حساب التشابه (cosine similarity) بين الاستعلام والوثائق
+    query_vec = model.encode([cleaned_query])
     scores = cosine_similarity(query_vec, embeddings)[0]
 
-    # تجميع الدرجات حسب كلستر الوثائق
+    # حساب مجموع الدرجات لكل كلستر
     clusters_scores = {}
     for doc_id, score in zip(doc_ids, scores):
-        cluster_label = doc_cluster_map.get(doc_id, -1)  # -1 للوثائق غير المصنفة
+        cluster_label = doc_cluster_map.get(doc_id, -1)
         clusters_scores.setdefault(cluster_label, 0)
         clusters_scores[cluster_label] += score
 
-    # ترتيب الكلسترات حسب مجموع الدرجات (score sum) تنازليًا
     sorted_clusters = sorted(clusters_scores.items(), key=lambda x: x[1], reverse=True)
 
-    # ترتيب الوثائق داخل كل كلستر حسب الدرجة (score)
-    results = []
+    results_scored = []
     for cluster_label, _ in sorted_clusters:
         cluster_docs = [doc_id for doc_id, cl_label in doc_cluster_map.items() if cl_label == cluster_label]
         cluster_docs_scores = []
@@ -359,17 +436,48 @@ def query_matching_service(request: MatchRequest):
             if idx is not None:
                 cluster_docs_scores.append((doc_id, scores[idx]))
         cluster_docs_scores.sort(key=lambda x: x[1], reverse=True)
-        results.extend(cluster_docs_scores)
+        results_scored.extend(cluster_docs_scores)
 
-    # أخذ أول top_k نتائج
-    results = results[:top_k]
-    results = [{"doc_id": doc_id, "score": float(score)} for doc_id, score in results]
+    # top-k
+    top_results = results_scored[:top_k]
 
+    # جلب النصوص من قاعدة البيانات
+    def get_table_name(dataset):
+        if dataset == "trec_tot":
+            return "trec_tot_documents"
+        elif dataset == "antique":
+            return "antique_documents"
+        else:
+            return None
+
+    DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data', 'ir_docs.db'))
+    table_name = get_table_name(dataset)
+    if table_name is None:
+        raise HTTPException(status_code=400, detail="❌ اسم مجموعة البيانات غير معروف")
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    results = []
+    for doc_id, score in top_results:
+        cursor.execute(f"SELECT doc_text FROM {table_name} WHERE doc_id = ?", (doc_id,))
+        row = cursor.fetchone()
+        text = row[0] if row else "النص غير متوفر"
+        results.append({
+            "doc_id": doc_id,
+            "score": float(score),
+            "text": text
+        })
+
+    conn.close()
     duration = round(time.perf_counter() - start_time, 4)
+
     return {
         "query": request.query,
+        "cleaned_query": cleaned_query,
         "dataset": dataset,
         "top_k": top_k,
         "duration_seconds": duration,
         "results": results
     }
+
